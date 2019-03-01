@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # @lint-avoid-python-3-compatibility-imports
 #
-# kvmstats KVM-related stats (runtime, co-scheduling time, steal)
+# kvmstats KVM-related stats (guest runtime and exit rate by reason)
 #          For Linux, uses BCC, eBPF.
 #
 # USAGE: kvmstats.py [-h] [-C] [-r MAXROWS] [interval] [count]
@@ -174,6 +174,8 @@ while 1:
 
     line = 0
     duration = datetime.utcnow() - begin_ts
+    total_count = {}
+    total_exits = 0
     print("## Collected data for %s seconds" % (duration.total_seconds()))
     for k, v in sorted(vm_stats.items(), key=lambda counts: counts[1].total_runtime,
                        reverse=True):
@@ -183,10 +185,15 @@ while 1:
         print("  KVM exit reasons:")
         reason_idx = 0
         tmp_count = {}
-        total_exits = 0
+        total_vm_exits = 0
         for exit_count in v.reasons_count:
             if exit_count > 0:
                 tmp_count[reason_idx] = exit_count
+                if reason_idx not in total_count:
+                    total_count[reason_idx] = exit_count
+                else:
+                    total_count[reason_idx] += exit_count
+                total_vm_exits += exit_count
                 total_exits += exit_count
             reason_idx += 1
 
@@ -194,11 +201,18 @@ while 1:
                                              reverse=True):
             print("    %s: %d (%0.03f / sec)" % (exit_reasons[reason_idx], exit_count,
                                   exit_count / duration.total_seconds()))
-        print("    total: %d (%0.03f/sec)" % (total_exits, total_exits / duration.total_seconds()))
+        print("    total: %d (%0.03f/sec)" % (total_vm_exits, total_vm_exits / duration.total_seconds()))
         line += 1
         if line >= maxrows:
             break
         print()
+
+    print("Total:")
+    for reason_idx, exit_count in sorted(total_count.iteritems(), key=lambda (k,v): (v,k),
+                                         reverse=True):
+        print("  %s: %d (%0.03f / sec)" % (exit_reasons[reason_idx], exit_count,
+                              exit_count / duration.total_seconds()))
+    print("  total: %d (%0.03f/sec)" % (total_exits, total_exits / duration.total_seconds()))
 
     if args.zero:
         vm_stats.clear()
