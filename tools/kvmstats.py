@@ -80,8 +80,18 @@ struct per_cpu_status_t {
     u64 last_kvm_entry;
 };
 
+struct msr_stats_key_t {
+    u32 tgid;
+    u32 ecx;
+};
+
+struct msr_stats_t {
+    u32 count;
+};
+
 BPF_HASH(vm_stats, u32, struct vm_stats_t);
 BPF_HASH(per_cpu_status, u32, struct per_cpu_status_t);
+BPF_HASH(vm_msr_stats, struct msr_stats_key_t, struct msr_stats_t);
 
 TRACEPOINT_PROBE(kvm, kvm_entry) {
     struct per_cpu_status_t *cpu_status, cpu_zero = {};
@@ -124,6 +134,24 @@ TRACEPOINT_PROBE(kvm, kvm_exit) {
 
     return 0;
 }
+
+TRACEPOINT_PROBE(kvm, kvm_msr) {
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    struct msr_stats_key_t msr_key = {
+            .tgid = tgid,
+            .ecx = args->ecx };
+    struct msr_stats_t *stats, stats_zero = {};
+
+    if (args->write != 1)
+        return 0;
+
+    stats = vm_msr_stats.lookup_or_init(&msr_key, &stats_zero);
+    if (!stats)
+        return 0;
+    stats->count++;
+
+    return 0;
+}
 """
 if args.tgid:
     bpf_text = bpf_text.replace('TGID_FILTER', 'tgid != %d' % args.tgid)
@@ -159,6 +187,7 @@ else:
     print('Tracing... Output on Ctrl-C')
 
 vm_stats = b.get_table('vm_stats')
+msr_stats = b.get_table('vm_msr_stats')
 exiting = 0
 
 while 1:
@@ -176,12 +205,21 @@ while 1:
     duration = datetime.utcnow() - begin_ts
     total_count = {}
     total_exits = 0
+    per_pid_msr_write = {}
+    for k, v in msr_stats.items():
+        if k.tgid not in per_pid_msr_write.keys():
+            per_pid_msr_write[k.tgid] = {}
+        if k.ecx not in per_pid_msr_write[k.tgid].keys():
+            per_pid_msr_write[k.tgid][k.ecx] = 0
+        per_pid_msr_write[k.tgid][k.ecx] += int(v.count)
+
     print("## Collected data for %s seconds" % (duration.total_seconds()))
     for k, v in sorted(vm_stats.items(), key=lambda counts: counts[1].total_runtime,
                        reverse=True):
         runtime = float(v.total_runtime) / 1000000000.0
-        pc_runtime = runtime / float(duration.total_seconds())
-        print("%s\n  vcpu(s) total runtime: %f s (%0.03f %%)" % (vm_list[int(k.value)], runtime, pc_runtime))
+        pc_runtime = runtime / float(duration.total_seconds()) * 100
+        pid = int(k.value)
+        print("%s\n  vcpu(s) total runtime: %f s (%0.03f %%)" % (vm_list[pid], runtime, pc_runtime))
         print("  KVM exit reasons:")
         reason_idx = 0
         tmp_count = {}
@@ -201,6 +239,10 @@ while 1:
                                              reverse=True):
             print("    %s: %d (%0.03f / sec)" % (exit_reasons[reason_idx], exit_count,
                                   exit_count / duration.total_seconds()))
+            if exit_reasons[reason_idx] == 'MSR_WRITE':
+                for msr, count in sorted(per_pid_msr_write[pid].items(), key=lambda (k,v): (v,k),
+                                         reverse=True):
+                    print("      0x%x: %d (%0.03f%%)" % (msr, count, float(count) / float(exit_count) * 100))
         print("    total: %d (%0.03f/sec)" % (total_vm_exits, total_vm_exits / duration.total_seconds()))
         line += 1
         if line >= maxrows:
@@ -216,6 +258,7 @@ while 1:
 
     if args.zero:
         vm_stats.clear()
+        msr_stats.clear()
         begin_ts = datetime.utcnow()
 
     countdown -= 1
